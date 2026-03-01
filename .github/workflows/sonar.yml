@@ -1,1 +1,113 @@
+name: Central Sonar Workflow
 
+on:
+  workflow_call:
+    secrets:
+      SONAR_TOKEN:
+        required: true
+      SONAR_HOST_URL:
+        required: true
+      OPENSEARCH_URL:
+        required: true
+      OPENSEARCH_USER:
+        required: true
+      OPENSEARCH_PASS:
+        required: true
+
+  workflow_dispatch:
+
+jobs:
+  sonar:
+    name: Build and Analyze
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Sonar Scanner
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y unzip
+          curl -sSLo sonar.zip https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/sonar-scanner-cli-5.0.1.3006-linux.zip
+          unzip sonar.zip
+          echo "$PWD/sonar-scanner-5.0.1.3006-linux/bin" >> $GITHUB_PATH
+
+      - name: Run SonarQube Scan
+        id: sonar
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          sonar-scanner \
+            -Dsonar.host.url=${{ secrets.SONAR_HOST_URL }} \
+            -Dsonar.login=${{ secrets.SONAR_TOKEN }} \
+            2>&1 | tee sonar.log
+
+      - name: Analyze Sonar result
+        id: analyze
+        run: |
+          if [ "${{ steps.sonar.outcome }}" != "failure" ]; then
+            echo "event_type=none" >> $GITHUB_ENV
+            exit 0
+          fi
+
+          if grep -qi "not authorized" sonar.log || \
+             grep -qi "authentication" sonar.log || \
+             grep -qi "401" sonar.log; then
+            echo "event_type=sonar_token_expired" >> $GITHUB_ENV
+            echo "severity=high" >> $GITHUB_ENV
+
+          elif grep -qi "QUALITY GATE STATUS: FAILED" sonar.log; then
+            echo "event_type=sonar_quality_gate_failed" >> $GITHUB_ENV
+            echo "severity=medium" >> $GITHUB_ENV
+
+          else
+            echo "event_type=sonar_scan_failed" >> $GITHUB_ENV
+            echo "severity=low" >> $GITHUB_ENV
+          fi
+
+          echo "error_text<<EOF" >> $GITHUB_ENV
+          tail -n 30 sonar.log >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+
+      - name: Send Sonar event to OpenSearch
+        if: env.event_type != 'none'
+        run: |
+          JSON=$(jq -n \
+            --arg event_type "${{ env.event_type }}" \
+            --arg severity "${{ env.severity }}" \
+            --arg repository "${{ github.repository }}" \
+            --arg branch "${{ github.ref_name }}" \
+            --arg commit_sha "${{ github.sha }}" \
+            --arg workflow "${{ github.workflow }}" \
+            --arg job "${{ github.job }}" \
+            --arg actor "${{ github.actor }}" \
+            --arg error_text "${{ env.error_text }}" \
+            --arg timestamp "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+            '{
+              event_type: $event_type,
+              severity: $severity,
+              repository: $repository,
+              branch: $branch,
+              commit_sha: $commit_sha,
+              workflow: $workflow,
+              job: $job,
+              actor: $actor,
+              error_text: $error_text,
+              timestamp: $timestamp
+            }')
+      
+          curl -X POST "${{ secrets.OPENSEARCH_URL }}/ci-security-logs/_doc" \
+            -H "Content-Type: application/json" \
+            -u "${{ secrets.OPENSEARCH_USER }}:${{ secrets.OPENSEARCH_PASS }}" \
+            -d "$JSON"
+
+
+      - name: Fail job if Sonar failed
+        if: env.event_type != 'none'
+        run: exit 1
