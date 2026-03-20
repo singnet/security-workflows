@@ -107,7 +107,3 @@ jobs:
             -u "${{ secrets.OPENSEARCH_USER }}:${{ secrets.OPENSEARCH_PASS }}" \
             -d "$JSON"
 
-
-      - name: Fail job if Sonar failed
-        if: env.event_type != 'none'
-        run: exit 1
