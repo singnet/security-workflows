@@ -19,8 +19,14 @@ on:
 jobs:
   sonar:
     if: |
-      github.event_name != 'pull_request' ||
-      github.event.pull_request.head.repo.full_name == github.repository
+      (
+        github.repository_owner == 'asi-alliance' ||
+        github.repository_owner == 'singnet'
+      ) &&
+      (
+        github.event_name != 'pull_request' ||
+        github.event.pull_request.head.repo.full_name == github.repository
+      )
 
     name: Build and Analyze
     runs-on: ubuntu-latest
