@@ -1,1 +1,104 @@
 
+name: Central Dependency Scan Workflow
+
+on:
+  workflow_call:
+    secrets:
+      OPENSEARCH_URL:
+        required: true
+      OPENSEARCH_USER:
+        required: true
+      OPENSEARCH_PASS:
+        required: true
+
+  workflow_dispatch:
+
+jobs:
+  dependency-scan:
+    name: Dependency Scan
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Verify package.json exists
+        run: |
+          test -f package.json
+
+      - name: Generate package-lock.json
+        run: |
+          npm install --package-lock-only --legacy-peer-deps
+
+      - name: Run npm audit
+        continue-on-error: true
+        run: |
+          npm audit --json > audit.json || true
+
+      - name: Analyze audit report
+        id: analyze
+        run: |
+          HIGH=$(jq '.metadata.vulnerabilities.high // 0' audit.json)
+          CRITICAL=$(jq '.metadata.vulnerabilities.critical // 0' audit.json)
+
+          echo "High: $HIGH"
+          echo "Critical: $CRITICAL"
+
+          if [ "$HIGH" -gt 0 ] || [ "$CRITICAL" -gt 0 ]; then
+            echo "event_type=npm_audit_failed" >> $GITHUB_ENV
+            echo "severity=high" >> $GITHUB_ENV
+            echo "scan_failed=true" >> $GITHUB_ENV
+
+            echo "error_text<<EOF" >> $GITHUB_ENV
+            cat audit.json >> $GITHUB_ENV
+            echo "EOF" >> $GITHUB_ENV
+          else
+            echo "event_type=none" >> $GITHUB_ENV
+            echo "scan_failed=false" >> $GITHUB_ENV
+          fi
+
+      - name: Send event to OpenSearch
+        if: env.event_type != 'none'
+        run: |
+          JSON=$(jq -n \
+            --arg event_type "${{ env.event_type }}" \
+            --arg severity "${{ env.severity }}" \
+            --arg repository "${{ github.repository }}" \
+            --arg branch "${{ github.ref_name }}" \
+            --arg commit_sha "${{ github.sha }}" \
+            --arg workflow "${{ github.workflow }}" \
+            --arg job "${{ github.job }}" \
+            --arg actor "${{ github.actor }}" \
+            --arg audit "${{ env.error_text }}" \
+            --arg timestamp "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+            '{
+              event_type: $event_type,
+              severity: $severity,
+              repository: $repository,
+              branch: $branch,
+              commit_sha: $commit_sha,
+              workflow: $workflow,
+              job: $job,
+              actor: $actor,
+              audit: ($audit | fromjson),
+              timestamp: $timestamp
+            }')
+
+          curl -X POST "${{ secrets.OPENSEARCH_URL }}/ci-security-logs/_doc" \
+            -H "Content-Type: application/json" \
+            -u "${{ secrets.OPENSEARCH_USER }}:${{ secrets.OPENSEARCH_PASS }}" \
+            -d "$JSON"
+
+      - name: Fail workflow
+        if: env.scan_failed == 'true'
+        run: |
+          echo "High or Critical vulnerabilities detected."
+          exit 1
