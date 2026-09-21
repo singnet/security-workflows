@@ -1,0 +1,212 @@
+name: SonarQube Token Rotation
+
+on:
+  workflow_call:
+    secrets:
+      SONAR_HOST_URL:
+        required: true
+      SONAR_ROTATOR_TOKEN:
+        required: true
+      SNET_SONARQUBE_APP_ID:
+        required: true
+      SNET_SONARQUBE_APP_KEY:
+        required: true
+
+jobs:
+  rotate:
+    name: Rotate SonarQube token
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    env:
+      SQ_URL: ${{ secrets.SONAR_HOST_URL }}
+      SQ_TOKEN: ${{ secrets.SONAR_ROTATOR_TOKEN }}
+      SECRET_NAME: SONAR_TOKEN
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Get SonarQube project key
+        id: project
+        run: |
+          set -euo pipefail
+
+          FILE="sonar-project.properties"
+
+          if [ ! -f "$FILE" ]; then
+            echo "Error: $FILE not found"
+            exit 1
+          fi
+
+          PROJECT_KEY=$(grep '^sonar\.projectKey=' "$FILE" | cut -d'=' -f2-)
+
+          if [ -z "$PROJECT_KEY" ]; then
+            echo "Error: sonar.projectKey is not defined in $FILE"
+            exit 1
+          fi
+
+          echo "Found SonarQube project key: $PROJECT_KEY"
+          echo "project_key=$PROJECT_KEY" >> "$GITHUB_OUTPUT"
+
+      - name: Install jq and gh
+        run: |
+          set -euo pipefail
+
+          sudo apt-get update -y
+          sudo apt-get install -y jq
+
+          gh --version
+          jq --version
+
+      - name: Sanity check
+        run: |
+          set -euo pipefail
+
+          BASE="${SQ_URL%/}"
+          BASE="${BASE%%/api*}"
+
+          RESP=$(curl -sS \
+            -H "Authorization: Bearer $SQ_TOKEN" \
+            -H "Accept: application/json" \
+            "$BASE/api/authentication/validate")
+
+          echo "$RESP" | grep -q '"valid"[[:space:]]*:[[:space:]]*true' || {
+            echo "Auth validate failed: $RESP"
+            exit 1
+          }
+
+          echo "SonarQube authentication successful"
+
+      - name: Generate Project Analysis Token
+        id: gen
+        env:
+          PROJECT_KEY: ${{ steps.project.outputs.project_key }}
+        run: |
+          set -euo pipefail
+
+          BASE="${SQ_URL%/}"
+          BASE="${BASE%%/api*}"
+
+          LABEL="${PROJECT_KEY}-ci-$(date +%Y%m%d%H%M%S)"
+
+          BODY=$(mktemp)
+          HDR=$(mktemp)
+
+          CODE=$(curl -sS -L \
+            -D "$HDR" \
+            -o "$BODY" \
+            -w "%{http_code}" \
+            -H "Authorization: Bearer $SQ_TOKEN" \
+            -H "Accept: application/json" \
+            -X POST "$BASE/api/user_tokens/generate" \
+            --data-urlencode "name=$LABEL" \
+            --data-urlencode "type=PROJECT_ANALYSIS_TOKEN" \
+            --data-urlencode "projectKey=$PROJECT_KEY")
+
+          echo "HTTP $CODE"
+
+          CT=$(grep -i '^content-type:' "$HDR" | head -n1 || true)
+          echo "Content-Type: ${CT:-<none>}"
+
+          echo "$CT" | grep -qi 'application/json' || {
+            echo "Non-JSON body head:"
+            head -c 400 "$BODY" || true
+            echo
+            exit 1
+          }
+
+          NEW_TOKEN=$(jq -r '.token // empty' "$BODY")
+
+          [ -n "$NEW_TOKEN" ] || {
+            echo "No .token field. Body head:"
+            head -c 400 "$BODY" || true
+            echo
+            exit 1
+          }
+
+          echo "token=$NEW_TOKEN" >> "$GITHUB_OUTPUT"
+
+          echo "Project analysis token generated successfully"
+
+      - name: Get GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.SNET_SONARQUBE_APP_ID }}
+          private-key: ${{ secrets.SNET_SONARQUBE_APP_KEY }}
+
+      - name: Update repository secret
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+
+          echo "${{ steps.gen.outputs.token }}" \
+            | gh secret set "$SECRET_NAME" \
+              --repo "$GITHUB_REPOSITORY"
+
+          echo "Updated $SECRET_NAME for $GITHUB_REPOSITORY"
+
+      - name: Revoke old tokens older than 120 days
+        env:
+          PROJECT_KEY: ${{ steps.project.outputs.project_key }}
+        run: |
+          set -euo pipefail
+
+          BASE="${SQ_URL%/}"
+          BASE="${BASE%%/api*}"
+
+          NOW=$(date +%s)
+
+          TOKENS=$(curl -sS \
+            -H "Authorization: Bearer $SQ_TOKEN" \
+            "$BASE/api/user_tokens/search")
+
+          LATEST=$(echo "$TOKENS" \
+            | jq -r \
+              --arg project "$PROJECT_KEY" \
+              '.userTokens[]
+              | select(.name | startswith($project + "-ci-"))
+              | .name' \
+            | head -n1)
+
+          echo "Latest token: $LATEST"
+
+          echo "$TOKENS" \
+            | jq -r '.userTokens[] | "\(.name)|\(.creationDate)"' \
+            | while IFS='|' read -r NAME DATE; do
+
+                case "$NAME" in
+                  ${PROJECT_KEY}-ci-*)
+
+                    if [ "$NAME" = "$LATEST" ]; then
+                      echo "Skipping the latest token: $NAME"
+                      continue
+                    fi
+
+                    TS=$(date -d "$DATE" +%s 2>/dev/null || echo 0)
+
+                    if [ "$TS" -eq 0 ]; then
+                      echo "Could not parse date $DATE for $NAME, skipping"
+                      continue
+                    fi
+
+                    AGE=$(( (NOW - TS) / 86400 ))
+
+                    if [ "$AGE" -gt 120 ]; then
+                      curl -sS \
+                        -H "Authorization: Bearer $SQ_TOKEN" \
+                        -X POST "$BASE/api/user_tokens/revoke" \
+                        --data-urlencode "name=$NAME" \
+                        >/dev/null
+
+                      echo "Revoked $NAME (age ${AGE}d)"
+                    fi
+
+                    ;;
+                esac
+
+              done
