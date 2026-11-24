@@ -20,9 +20,9 @@ jobs:
           fetch-depth: 0
 
       - name: Run pip-audit
-        continue-on-error: true
         uses: pypa/gh-action-pip-audit@v1.1.0
         with:
           inputs: requirements.txt
           no-deps: true
           summary: true
+          internal-be-careful-allow-failure: true
