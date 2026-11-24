@@ -1,0 +1,27 @@
+name: Python Dependency Audit
+
+on:
+  workflow_call:
+
+  workflow_dispatch:
+
+jobs:
+  pip-audit:
+    name: Audit Python dependencies
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Run pip-audit
+        uses: pypa/gh-action-pip-audit@v1.1.0
+        with:
+          inputs: requirements.txt
+          no-deps: true
+          summary: true
